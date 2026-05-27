@@ -10,6 +10,7 @@ dist/
 !.env.example
 
 # whatsapp local session/cache
+.baileys_auth/
 .wwebjs_auth/
 .wwebjs_cache/
 

@@ -1,224 +1,278 @@
-import pkg from 'whatsapp-web.js';
-const { Client, LocalAuth } = pkg;
+import fs from 'fs';
+import path from 'path';
+import makeWASocket, {
+  Browsers,
+  DisconnectReason,
+  downloadMediaMessage,
+  getContentType,
+  normalizeMessageContent,
+  proto,
+  useMultiFileAuthState,
+  type ConnectionState,
+  type WAMessage,
+  type WASocket,
+} from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
+import pino from 'pino';
 import { AIService, AIServiceError, MacroEstimate } from './ai.js';
 
+type ContextInfoCarrier = {
+  text?: string | null;
+  caption?: string | null;
+  contextInfo?: proto.IContextInfo | null;
+};
+
 export class WhatsAppService {
-  private client: any;
+  private socket: WASocket | null;
   private readonly aiService: AIService;
+  private readonly logger;
   private readonly triggerAliases: string[];
-  private botWid: unknown;
+  private readonly targetGroupName: string | null;
+  private readonly authDir: string;
+  private botJids: string[];
+  private reconnectInProgress: boolean;
 
   constructor() {
+    this.socket = null;
     this.aiService = new AIService();
+    this.logger = pino({ level: 'silent' });
     this.triggerAliases = this.loadTriggerAliases();
-    this.botWid = null;
-    this.client = new Client({
-      // LocalAuth saves the session token inside a local directory (.wwebjs_auth)
-      // This means you only need to scan the QR code once!
-      authStrategy: new LocalAuth(),
-      puppeteer: {
-        headless: true,
-        args: [
-          '--no-sandbox', 
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--single-process'
-        ],
+    this.targetGroupName = process.env.TARGET_GROUP_NAME?.trim() || null;
+    this.authDir = path.join(process.cwd(), '.baileys_auth');
+    this.botJids = [];
+    this.reconnectInProgress = false;
+  }
+
+  public async initialize(): Promise<void> {
+    await this.startSocket();
+  }
+
+  private async startSocket(): Promise<void> {
+    this.ensureAuthDirectory();
+    this.injectSessionCredsIfNeeded();
+
+    const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+    const socket = makeWASocket({
+      auth: state,
+      browser: Browsers.macOS('Meal Tracker BOT'),
+      logger: this.logger,
+      printQRInTerminal: false,
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+    });
+
+    this.socket = socket;
+    this.botJids = this.extractBotJids(socket.user);
+
+    socket.ev.on('creds.update', saveCreds);
+    socket.ev.on('connection.update', async (update) => {
+      await this.handleConnectionUpdate(update);
+    });
+    socket.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') {
+        return;
+      }
+
+      for (const message of messages) {
+        try {
+          await this.handleIncomingMessage(message);
+        } catch (error) {
+          console.error('Error handling incoming message:', error);
+        }
       }
     });
   }
 
-  public initialize(): void {
-    // Event: Triggers when a QR code needs to be scanned
-    this.client.on('qr', (qr: string) => {
+  private async handleConnectionUpdate(update: Partial<ConnectionState>): Promise<void> {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
       console.log('\n==================================================================');
-      console.log('▼ SCAN THIS QR CODE USING YOUR BOT\'S WHATSAPP APPLICTION (LINK DEVICE):');
+      console.log("▼ SCAN THIS QR CODE USING YOUR BOT'S WHATSAPP APPLICATION (LINK DEVICE):");
       console.log('==================================================================\n');
       qrcode.generate(qr, { small: true });
-    });
+    }
 
-    this.client.on('authenticated', () => {
-      console.log('Authenticated with WhatsApp.');
-    });
+    if (connection === 'connecting') {
+      console.log('Connecting to WhatsApp via Baileys...');
+      return;
+    }
 
-    this.client.on('auth_failure', (message: string) => {
-      console.error('WhatsApp authentication failed:', message);
-    });
-
-    this.client.on('loading_screen', (percent: number, message: string) => {
-      console.log(`Loading WhatsApp client: ${percent}% - ${message}`);
-    });
-
-    this.client.on('change_state', (state: string) => {
-      console.log(`WhatsApp state changed: ${state}`);
-    });
-
-    this.client.on('disconnected', (reason: string) => {
-      console.error(`WhatsApp client disconnected: ${reason}`);
-    });
-
-    // Event: Triggers when the client successfully authenticates and loads
-    this.client.on('ready', async () => {
-      this.botWid = this.client?.info?.wid || null;
+    if (connection === 'open') {
+      this.reconnectInProgress = false;
+      this.botJids = this.extractBotJids(this.socket?.user);
       console.log('\n🚀 Success! Meal Tracker Bot is officially online and listening!');
-      console.log('Listening in any group where this bot is mentioned with @ or called by its trigger name.');
-      console.log(`Bot WhatsApp ID: ${this.serializeWhatsAppId(this.botWid) ?? 'unknown'}`);
-      console.log(`Trigger aliases: ${this.triggerAliases.join(', ')}`);
-
-      try {
-        const chats = await this.client.getChats();
-        const groupNames = chats
-          .filter((chat: any) => chat.isGroup)
-          .map((chat: any) => chat.name);
-
-        console.log('Detected WhatsApp groups:', groupNames);
-      } catch (error) {
-        console.error('Failed to load chat list:', error);
-      }
-    });
-
-    this.client.on('message_create', async (msg: any) => {
-      const chat = await msg.getChat();
+      console.log('Running on Baileys WebSocket transport.');
       console.log(
-        `[message_create] fromMe=${msg.fromMe} chat="${chat.name}" body="${msg.body}" hasMedia=${msg.hasMedia} mentions=${JSON.stringify(msg.mentionedIds || [])}`
+        this.targetGroupName
+          ? `Listening only in group: "${this.targetGroupName}", and only when the bot is called.`
+          : 'Listening in any group where this bot is mentioned with @ or called by its trigger name.'
       );
-    });
+      console.log(`Bot WhatsApp IDs: ${this.botJids.length > 0 ? this.botJids.join(', ') : 'unknown'}`);
+      console.log(`Trigger aliases: ${this.triggerAliases.join(', ')}`);
+      return;
+    }
 
-    // Event: Listens to incoming text/media messages
-    this.client.on('message', async (msg: any) => {
-      try {
-        await this.handleIncomingMessage(msg);
-      } catch (error) {
-        console.error('Error handling incoming message:', error);
+    if (connection === 'close') {
+      const statusCode = this.getDisconnectStatusCode(lastDisconnect?.error);
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      console.error('WhatsApp connection closed:', lastDisconnect?.error);
+
+      if (shouldReconnect) {
+        if (this.reconnectInProgress) {
+          return;
+        }
+
+        this.reconnectInProgress = true;
+        console.log('Reconnecting to WhatsApp...');
+        await this.delay(5000);
+        await this.startSocket();
+      } else {
+        console.error('WhatsApp session logged out. Delete .baileys_auth and link again.');
       }
-    });
-
-    this.client.initialize();
+    }
   }
 
-  private async handleIncomingMessage(msg: any): Promise<void> {
-    const chat = await msg.getChat();
+  private async handleIncomingMessage(message: WAMessage): Promise<void> {
+    const remoteJid = message.key.remoteJid;
+    const normalizedRemoteJid = this.normalizeJid(remoteJid);
+    const isGroup = Boolean(normalizedRemoteJid?.endsWith('@g.us'));
+    const fromMe = Boolean(message.key.fromMe);
+    const body = this.extractMessageText(message);
+    const hasMedia = this.hasMedia(message);
+    const mentionedIds = this.getMentionedIds(message);
+
     console.log(
-      `[message] fromMe=${msg.fromMe} group=${chat.isGroup} chat="${chat.name}" body="${msg.body}" hasMedia=${msg.hasMedia} mentions=${JSON.stringify(msg.mentionedIds || [])}`
+      `[message] fromMe=${fromMe} group=${isGroup} chat="${normalizedRemoteJid}" body="${body}" hasMedia=${hasMedia} mentions=${JSON.stringify(mentionedIds)}`
     );
 
-    if (!chat.isGroup) {
+    if (!remoteJid || !isGroup || fromMe) {
       return;
     }
 
-    if (msg.fromMe) {
-      return;
+    if (this.targetGroupName) {
+      const metadata = await this.socket?.groupMetadata(remoteJid);
+      const subject = metadata?.subject?.trim() || '';
+      if (subject !== this.targetGroupName) {
+        console.log(`Ignoring group "${subject}" because it does not match TARGET_GROUP_NAME.`);
+        return;
+      }
     }
 
-    const commandText = await this.extractCommandText(msg);
+    const commandText = this.extractCommandText(message);
     if (commandText === null) {
-      console.log(`Ignoring message in "${chat.name}" because the bot was not mentioned.`);
+      console.log(`Ignoring message in "${normalizedRemoteJid}" because the bot was not mentioned.`);
       return;
     }
 
     const command = commandText.split(/\s+/)[0]?.toLowerCase() || '';
 
-    if (msg.hasMedia && command !== '!help') {
-      await this.handleMentionedMediaMessage(msg);
+    if (hasMedia && command !== '!help') {
+      await this.handleMentionedMediaMessage(message);
       return;
     }
 
     if (!commandText || command === '!help') {
-      await msg.reply(this.getHelpMessage());
+      await this.reply(message, this.getHelpMessage());
       return;
     }
 
     if (command === '!log') {
       const foodText = commandText.replace(/!log/i, '').trim();
       if (!foodText) {
-        await msg.reply('❌ Format belum lengkap. Contoh: `@bot !log 200g dada ayam panggang` atau kirim foto dengan caption `@bot !log`.');
+        await this.reply(
+          message,
+          '❌ Format belum lengkap. Contoh: `@bot !log 200g dada ayam panggang` atau kirim foto dengan caption `@bot`.'
+        );
         return;
       }
 
-      await this.handleMentionedTextLog(msg, foodText);
+      await this.handleMentionedTextLog(message, foodText);
       return;
     }
-    await msg.reply('❓ Perintah belum dikenali. Kirim `@bot !help` untuk melihat cara pakai.');
+
+    await this.reply(message, '❓ Perintah belum dikenali. Kirim `@bot !help` untuk melihat cara pakai.');
   }
 
-  private async handleMentionedTextLog(msg: any, foodText: string): Promise<void> {
+  private async handleMentionedTextLog(message: WAMessage, foodText: string): Promise<void> {
     if (!this.aiService.isConfigured()) {
-      await msg.reply('❌ GEMINI_API_KEY belum disetel. Tambahkan dulu di file .env agar analisis bisa jalan.');
+      await this.reply(message, '❌ GEMINI_API_KEY belum disetel. Tambahkan dulu di file .env agar analisis bisa jalan.');
       return;
     }
 
-    const processingMsg = await msg.reply(`📝 Processing text entry: "${foodText}"...`);
+    const processingMessage = await this.reply(message, `📝 Processing text entry: "${foodText}"...`);
 
     try {
       const macros = await this.aiService.analyzeTextPayload(foodText);
-      await processingMsg.delete(true);
-      await msg.reply(this.formatMacroResponse(macros));
+      await this.deleteMessage(processingMessage);
+      await this.reply(message, this.formatMacroResponse(macros));
     } catch (error) {
       console.error('Failed to analyze text payload:', error);
-      await msg.reply(this.getFriendlyErrorMessage(error, '❌ Gagal menganalisis log teks. Coba tulis makanan dan porsinya lebih jelas ya.'));
+      await this.reply(
+        message,
+        this.getFriendlyErrorMessage(error, '❌ Gagal menganalisis log teks. Coba tulis makanan dan porsinya lebih jelas ya.')
+      );
     }
   }
 
-  private async handleMentionedMediaMessage(msg: any): Promise<void> {
+  private async handleMentionedMediaMessage(message: WAMessage): Promise<void> {
     if (!this.aiService.isConfigured()) {
-      await msg.reply('❌ GEMINI_API_KEY belum disetel. Tambahkan dulu di file .env agar analisis foto bisa jalan.');
+      await this.reply(message, '❌ GEMINI_API_KEY belum disetel. Tambahkan dulu di file .env agar analisis foto bisa jalan.');
       return;
     }
 
-    const processingMsg = await msg.reply('📸 Food photo detected! Analyzing nutrients, hold tight...');
+    const processingMessage = await this.reply(message, '📸 Food photo detected! Analyzing nutrients, hold tight...');
 
     try {
-      const media = await msg.downloadMedia();
-      if (!media?.data || !media.mimetype) {
+      if (!this.socket) {
+        throw new Error('WhatsApp socket is not ready.');
+      }
+
+      const mediaBuffer = await downloadMediaMessage(message, 'buffer', {}, {
+        reuploadRequest: this.socket.updateMediaMessage,
+        logger: this.logger,
+      });
+      const mimeType = this.extractMimeType(message);
+
+      if (!mediaBuffer || !mimeType) {
         throw new Error('Media download returned no data.');
       }
 
-      const macros = await this.aiService.analyzeImagePayload(media.data, media.mimetype);
-      await processingMsg.delete(true);
-      await msg.reply(this.formatMacroResponse(macros));
+      const macros = await this.aiService.analyzeImagePayload(mediaBuffer.toString('base64'), mimeType);
+      await this.deleteMessage(processingMessage);
+      await this.reply(message, this.formatMacroResponse(macros));
     } catch (error) {
       console.error('Failed to analyze image payload:', error);
-      await msg.reply(this.getFriendlyErrorMessage(error, '❌ Ups, fotonya belum berhasil diproses. Coba kirim ulang dengan gambar yang lebih jelas.'));
+      await this.reply(
+        message,
+        this.getFriendlyErrorMessage(error, '❌ Ups, fotonya belum berhasil diproses. Coba kirim ulang dengan gambar yang lebih jelas.')
+      );
     }
   }
 
-  private async extractCommandText(msg: any): Promise<string | null> {
-    const body = typeof msg.body === 'string' ? msg.body.trim() : '';
-    if (!body && !msg.hasMedia) {
+  private extractCommandText(message: WAMessage): string | null {
+    const body = this.extractMessageText(message).trim();
+    const hasMedia = this.hasMedia(message);
+
+    if (!body && !hasMedia) {
       return null;
     }
 
-    if (await this.hasStructuredMention(msg)) {
+    if (this.hasStructuredMention(message)) {
       return this.normalizeCommandText(body);
     }
 
     return this.extractTextTriggeredCommand(body);
   }
 
-  private async hasStructuredMention(msg: any): Promise<boolean> {
-    if (!this.botWid) {
+  private hasStructuredMention(message: WAMessage): boolean {
+    if (this.botJids.length === 0) {
       return false;
     }
 
-    const mentionedIds = (Array.isArray(msg.mentionedIds) ? msg.mentionedIds : [])
-      .map((id: unknown) => this.serializeWhatsAppId(id))
-      .filter(Boolean) as string[];
-
-    if (mentionedIds.length === 0) {
-      return false;
-    }
-
-    const directBotId = this.serializeWhatsAppId(this.botWid);
-    if (directBotId && mentionedIds.includes(directBotId)) {
-      return true;
-    }
-
-    const botKeys = new Set(this.getComparableIdKeys(directBotId));
-    for (const mentionedId of mentionedIds) {
+    const botKeys = new Set(this.botJids.flatMap((jid) => this.getComparableIdKeys(jid)));
+    for (const mentionedId of this.getMentionedIds(message)) {
       for (const key of this.getComparableIdKeys(mentionedId)) {
         if (botKeys.has(key)) {
           return true;
@@ -226,32 +280,64 @@ export class WhatsAppService {
       }
     }
 
-    try {
-      const mappings = await this.client.getContactLidAndPhone([directBotId, ...mentionedIds]);
-      const botMapping = mappings[0];
-      const botResolvedIds = [directBotId, botMapping?.lid, botMapping?.pn]
-        .map((value) => this.serializeWhatsAppId(value))
-        .filter(Boolean) as string[];
-      const botResolvedKeys = new Set(botResolvedIds.flatMap((value) => this.getComparableIdKeys(value)));
+    return false;
+  }
 
-      for (const mapping of mappings.slice(1)) {
-        const mentionResolvedIds = [mapping?.lid, mapping?.pn]
-          .map((value) => this.serializeWhatsAppId(value))
-          .filter(Boolean) as string[];
-
-        for (const resolvedId of mentionResolvedIds) {
-          for (const key of this.getComparableIdKeys(resolvedId)) {
-            if (botResolvedKeys.has(key)) {
-              return true;
-            }
-          }
-        }
-      }
-    } catch (error) {
-      console.error('Failed to resolve mention IDs:', error);
+  private getMentionedIds(message: WAMessage): string[] {
+    const content = normalizeMessageContent(message.message);
+    if (!content) {
+      return [];
     }
 
-    return false;
+    const contentType = getContentType(content);
+    if (!contentType) {
+      return [];
+    }
+
+    const typedContent = content[contentType] as ContextInfoCarrier | null | undefined;
+    const mentionedJids = typedContent?.contextInfo?.mentionedJid || [];
+
+    return mentionedJids
+      .map((jid) => this.normalizeJid(jid))
+      .filter(Boolean) as string[];
+  }
+
+  private extractMessageText(message: WAMessage): string {
+    const content = normalizeMessageContent(message.message);
+    if (!content) {
+      return '';
+    }
+
+    if (content.conversation) {
+      return content.conversation;
+    }
+
+    const contentType = getContentType(content);
+    if (!contentType) {
+      return '';
+    }
+
+    const typedContent = content[contentType] as ContextInfoCarrier | null | undefined;
+    return typedContent?.text || typedContent?.caption || '';
+  }
+
+  private hasMedia(message: WAMessage): boolean {
+    return Boolean(this.extractMimeType(message));
+  }
+
+  private extractMimeType(message: WAMessage): string | null {
+    const content = normalizeMessageContent(message.message);
+    if (!content) {
+      return null;
+    }
+
+    const contentType = getContentType(content);
+    if (!contentType) {
+      return null;
+    }
+
+    const typedContent = content[contentType] as { mimetype?: string | null } | null | undefined;
+    return typedContent?.mimetype || null;
   }
 
   private extractTextTriggeredCommand(text: string): string | null {
@@ -289,41 +375,28 @@ export class WhatsAppService {
     return [...new Set(aliases)];
   }
 
-  private escapeRegExp(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-
-  private serializeWhatsAppId(value: unknown): string | null {
-    if (!value) {
+  private normalizeJid(jid: string | null | undefined): string | null {
+    if (!jid) {
       return null;
     }
 
-    if (typeof value === 'string') {
-      return value;
+    return jid.toLowerCase();
+  }
+
+  private extractBotJids(user: { id?: string; lid?: string; phoneNumber?: string } | null | undefined): string[] {
+    if (!user) {
+      return [];
     }
 
-    if (typeof value === 'object' && value !== null && '_serialized' in value) {
-      const serialized = (value as { _serialized?: unknown })._serialized;
-      return typeof serialized === 'string' ? serialized : null;
-    }
+    const candidates = [
+      this.normalizeJid(user.id),
+      this.normalizeJid(user.lid),
+      this.normalizeJid(user.phoneNumber),
+      this.normalizeJid(user.phoneNumber ? `${user.phoneNumber}@s.whatsapp.net` : null),
+      this.normalizeJid(user.phoneNumber ? `${user.phoneNumber}@lid` : null),
+    ];
 
-    if (typeof value === 'object' && value !== null) {
-      const maybeWid = value as {
-        user?: unknown;
-        server?: unknown;
-        id?: unknown;
-      };
-
-      if (typeof maybeWid.user === 'string' && typeof maybeWid.server === 'string') {
-        return `${maybeWid.user}@${maybeWid.server}`;
-      }
-
-      if (maybeWid.id) {
-        return this.serializeWhatsAppId(maybeWid.id);
-      }
-    }
-
-    return null;
+    return [...new Set(candidates.filter(Boolean) as string[])];
   }
 
   private getComparableIdKeys(id: string | null): string[] {
@@ -331,11 +404,15 @@ export class WhatsAppService {
       return [];
     }
 
-    const bareId = id.toLowerCase();
-    const userPart = bareId.split('@')[0];
+    const normalized = id.toLowerCase();
+    const userPart = normalized.split('@')[0].split(':')[0];
     const digitPart = userPart.replace(/\D/g, '');
 
-    return [...new Set([bareId, userPart, digitPart].filter(Boolean))];
+    return [...new Set([normalized, userPart, digitPart].filter(Boolean))];
+  }
+
+  private escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   private getHelpMessage(): string {
@@ -375,5 +452,58 @@ export class WhatsAppService {
     }
 
     return fallback;
+  }
+
+  private async reply(message: WAMessage, text: string): Promise<WAMessage | undefined> {
+    if (!this.socket || !message.key.remoteJid) {
+      return undefined;
+    }
+
+    return this.socket.sendMessage(message.key.remoteJid, { text }, { quoted: message });
+  }
+
+  private async deleteMessage(message: WAMessage | undefined): Promise<void> {
+    if (!this.socket || !message?.key.remoteJid || !message.key.id) {
+      return;
+    }
+
+    await this.socket.sendMessage(message.key.remoteJid, { delete: message.key });
+  }
+
+  private ensureAuthDirectory(): void {
+    if (!fs.existsSync(this.authDir)) {
+      fs.mkdirSync(this.authDir, { recursive: true });
+    }
+  }
+
+  private injectSessionCredsIfNeeded(): void {
+    const credsPath = path.join(this.authDir, 'creds.json');
+    const credsJson = process.env.SESSION_CREDS_JSON;
+
+    if (credsJson && !fs.existsSync(credsPath)) {
+      fs.writeFileSync(credsPath, credsJson);
+      console.log('🔒 Session credentials injected successfully from environment variables.');
+    }
+  }
+
+  private getDisconnectStatusCode(error: unknown): number | undefined {
+    if (!error || typeof error !== 'object') {
+      return undefined;
+    }
+
+    const maybeBoom = error as {
+      output?: {
+        statusCode?: number;
+      };
+      statusCode?: number;
+    };
+
+    return maybeBoom.output?.statusCode ?? maybeBoom.statusCode;
+  }
+
+  private async delay(ms: number): Promise<void> {
+    await new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
   }
 }
