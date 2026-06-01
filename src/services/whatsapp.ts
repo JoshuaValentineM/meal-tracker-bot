@@ -38,7 +38,7 @@ export class WhatsAppService {
     this.logger = pino({ level: 'silent' });
     this.triggerAliases = this.loadTriggerAliases();
     this.targetGroupName = process.env.TARGET_GROUP_NAME?.trim() || null;
-    this.authDir = path.join(process.cwd(), '.baileys_auth');
+    this.authDir = process.env.BAILEYS_AUTH_DIR?.trim() || path.join(process.cwd(), '.baileys_auth');
     this.botJids = [];
     this.reconnectInProgress = false;
   }

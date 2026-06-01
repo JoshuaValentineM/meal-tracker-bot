@@ -23,3 +23,6 @@ npm-debug.log*
 
 # private AI/session context
 docs/PROJECT_CONTEXT_AND_CHAT_HISTORY.md
+docs/FREE_DEPLOYMENT_GUIDE.md
+docs/RENDER_DEPLOYMENT_PLAN.md
+

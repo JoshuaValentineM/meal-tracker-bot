@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: meal-tracker-bot
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    maxShutdownDelaySeconds: 60
+    disk:
+      name: baileys-auth
+      mountPath: /opt/render/project/src/.baileys_auth
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash-lite
+      - key: BOT_TRIGGER_ALIASES
+        value: Meal Tracker BOT
+      - key: TARGET_GROUP_NAME
+        value: Our Food Journal
+      - key: BAILEYS_AUTH_DIR
+        value: /opt/render/project/src/.baileys_auth

@@ -5,11 +5,15 @@
   "main": "index.js",
   "scripts": {
     "dev": "npm run build && node dist/index.js",
-    "build": "tsc"
+    "build": "tsc",
+    "start": "node dist/index.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=20 <26"
+  },
   "type": "commonjs",
   "dependencies": {
     "@google/genai": "^2.6.0",
