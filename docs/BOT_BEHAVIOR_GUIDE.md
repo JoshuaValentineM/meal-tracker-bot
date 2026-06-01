@@ -70,12 +70,13 @@ The bot applies these filters in order:
 
 1. It only handles group chats.
 2. It ignores messages sent by itself.
-3. If `TARGET_GROUP_NAME` is set, it only handles that exact group subject.
-4. It checks whether the bot was called either by:
+3. By default, it can respond in any group.
+4. If `TARGET_GROUP_NAME` is set, it only handles that exact group subject.
+5. It checks whether the bot was called either by:
    - a real WhatsApp `@mention`
    - a configured plain-text trigger alias such as `@Meal Tracker BOT`
-5. If the message has media and the bot was called, it analyzes the image.
-6. If the message is text and includes a supported command, it runs that command.
+6. If the message has media and the bot was called, it analyzes the image.
+7. If the message is text and includes a supported command, it runs that command.
 
 ### Group-Only Behavior
 
@@ -83,13 +84,21 @@ The bot currently does not respond in direct chats.
 
 ### Optional Group Lock
 
-The bot can still be restricted to one exact group by subject using:
+The bot can still be restricted to one exact group by subject if needed later:
 
 ```env
 TARGET_GROUP_NAME=Our Food Journal
 ```
 
-If this is set, the bot ignores any other group.
+Default:
+
+```env
+TARGET_GROUP_NAME=
+```
+
+With the default empty value, the bot can respond in any group where it is called by mention or trigger alias.
+
+If a group name is set, the bot ignores any other group.
 
 ## Mention And Trigger Behavior
 
@@ -288,7 +297,7 @@ Example:
 GEMINI_API_KEY=your_gemini_api_key_here
 GEMINI_MODEL=gemini-2.5-flash-lite
 BOT_TRIGGER_ALIASES=Meal Tracker BOT
-TARGET_GROUP_NAME=Our Food Journal
+TARGET_GROUP_NAME=
 SESSION_CREDS_JSON=
 ```
 

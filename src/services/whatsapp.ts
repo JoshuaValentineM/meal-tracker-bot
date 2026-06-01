@@ -31,6 +31,10 @@ export class WhatsAppService {
   private readonly authDir: string;
   private botJids: string[];
   private reconnectInProgress: boolean;
+  private connectionState: string;
+  private lastOpenAt: string | null;
+  private lastCloseAt: string | null;
+  private lastMessageAt: string | null;
 
   constructor() {
     this.socket = null;
@@ -41,10 +45,29 @@ export class WhatsAppService {
     this.authDir = process.env.BAILEYS_AUTH_DIR?.trim() || path.join(process.cwd(), '.baileys_auth');
     this.botJids = [];
     this.reconnectInProgress = false;
+    this.connectionState = 'initializing';
+    this.lastOpenAt = null;
+    this.lastCloseAt = null;
+    this.lastMessageAt = null;
   }
 
   public async initialize(): Promise<void> {
     await this.startSocket();
+  }
+
+  public getStatus(): Record<string, unknown> {
+    return {
+      service: 'meal-tracker-bot',
+      whatsappConnection: this.connectionState,
+      connected: this.connectionState === 'open',
+      botJids: this.botJids,
+      targetGroupName: this.targetGroupName,
+      triggerAliases: this.triggerAliases,
+      lastOpenAt: this.lastOpenAt,
+      lastCloseAt: this.lastCloseAt,
+      lastMessageAt: this.lastMessageAt,
+      uptimeSeconds: Math.round(process.uptime()),
+    };
   }
 
   private async startSocket(): Promise<void> {
@@ -94,11 +117,14 @@ export class WhatsAppService {
     }
 
     if (connection === 'connecting') {
+      this.connectionState = 'connecting';
       console.log('Connecting to WhatsApp via Baileys...');
       return;
     }
 
     if (connection === 'open') {
+      this.connectionState = 'open';
+      this.lastOpenAt = new Date().toISOString();
       this.reconnectInProgress = false;
       this.botJids = this.extractBotJids(this.socket?.user);
       console.log('\n🚀 Success! Meal Tracker Bot is officially online and listening!');
@@ -114,6 +140,8 @@ export class WhatsAppService {
     }
 
     if (connection === 'close') {
+      this.connectionState = 'close';
+      this.lastCloseAt = new Date().toISOString();
       const statusCode = this.getDisconnectStatusCode(lastDisconnect?.error);
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -135,6 +163,7 @@ export class WhatsAppService {
   }
 
   private async handleIncomingMessage(message: WAMessage): Promise<void> {
+    this.lastMessageAt = new Date().toISOString();
     const remoteJid = message.key.remoteJid;
     const normalizedRemoteJid = this.normalizeJid(remoteJid);
     const isGroup = Boolean(normalizedRemoteJid?.endsWith('@g.us'));
