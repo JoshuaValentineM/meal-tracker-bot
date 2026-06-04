@@ -15,6 +15,8 @@ import makeWASocket, {
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
 import { AIService, AIServiceError, MacroEstimate } from './ai.js';
+import { MealLogService } from './mealLog.js';
+import type { MealLog, MealSourceType } from '../types/meal-log.js';
 
 type ContextInfoCarrier = {
   text?: string | null;
@@ -25,6 +27,7 @@ type ContextInfoCarrier = {
 export class WhatsAppService {
   private socket: WASocket | null;
   private readonly aiService: AIService;
+  private readonly mealLogService: MealLogService;
   private readonly logger;
   private readonly triggerAliases: string[];
   private readonly targetGroupName: string | null;
@@ -39,6 +42,7 @@ export class WhatsAppService {
   constructor() {
     this.socket = null;
     this.aiService = new AIService();
+    this.mealLogService = new MealLogService();
     this.logger = pino({ level: 'silent' });
     this.triggerAliases = this.loadTriggerAliases();
     this.targetGroupName = process.env.TARGET_GROUP_NAME?.trim() || null;
@@ -63,6 +67,7 @@ export class WhatsAppService {
       botJids: this.botJids,
       targetGroupName: this.targetGroupName,
       triggerAliases: this.triggerAliases,
+      mealLogStorageConfigured: this.mealLogService.isConfigured(),
       lastOpenAt: this.lastOpenAt,
       lastCloseAt: this.lastCloseAt,
       lastMessageAt: this.lastMessageAt,
@@ -234,8 +239,9 @@ export class WhatsAppService {
 
     try {
       const macros = await this.aiService.analyzeTextPayload(foodText);
+      const saved = await this.saveMealLogForMessage(message, 'text', foodText, macros);
       await this.deleteMessage(processingMessage);
-      await this.reply(message, this.formatMacroResponse(macros));
+      await this.reply(message, this.formatMacroResponse(macros, saved));
     } catch (error) {
       console.error('Failed to analyze text payload:', error);
       await this.reply(
@@ -269,8 +275,9 @@ export class WhatsAppService {
       }
 
       const macros = await this.aiService.analyzeImagePayload(mediaBuffer.toString('base64'), mimeType);
+      const saved = await this.saveMealLogForMessage(message, 'image', this.extractMessageText(message).trim(), macros);
       await this.deleteMessage(processingMessage);
-      await this.reply(message, this.formatMacroResponse(macros));
+      await this.reply(message, this.formatMacroResponse(macros, saved));
     } catch (error) {
       console.error('Failed to analyze image payload:', error);
       await this.reply(
@@ -348,6 +355,68 @@ export class WhatsAppService {
 
     const typedContent = content[contentType] as ContextInfoCarrier | null | undefined;
     return typedContent?.text || typedContent?.caption || '';
+  }
+
+  private async saveMealLogForMessage(
+    message: WAMessage,
+    sourceType: MealSourceType,
+    inputText: string,
+    macros: MacroEstimate
+  ): Promise<boolean> {
+    try {
+      const mealLog = await this.buildMealLog(message, sourceType, inputText, macros);
+      await this.mealLogService.saveMealLog(mealLog);
+      return true;
+    } catch (error) {
+      console.error('Failed to save meal log:', error);
+      return false;
+    }
+  }
+
+  private async buildMealLog(
+    message: WAMessage,
+    sourceType: MealSourceType,
+    inputText: string,
+    macros: MacroEstimate
+  ): Promise<MealLog> {
+    const groupJid = this.normalizeJid(message.key.remoteJid);
+    const senderJid = this.normalizeJid(message.key.participant || message.participant || null);
+
+    if (!groupJid) {
+      throw new Error('Cannot save meal log without group JID.');
+    }
+
+    if (!senderJid) {
+      throw new Error('Cannot save meal log without sender JID.');
+    }
+
+    return {
+      createdAt: new Date().toISOString(),
+      groupJid,
+      groupName: await this.getGroupName(groupJid),
+      senderJid,
+      senderName: message.pushName?.trim() || undefined,
+      messageId: message.key.id || undefined,
+      sourceType,
+      inputText: inputText || undefined,
+      foodName: macros.foodName,
+      calories: macros.calories,
+      protein: macros.protein,
+      carbs: macros.carbs,
+      fiber: macros.fiber,
+      aiModel: this.aiService.getModelName(),
+      rawEstimateJson: { ...macros },
+    };
+  }
+
+  private async getGroupName(groupJid: string): Promise<string | undefined> {
+    try {
+      const metadata = await this.socket?.groupMetadata(groupJid);
+      return metadata?.subject?.trim() || undefined;
+    } catch (error) {
+      console.warn(`Could not load group metadata for "${groupJid}" while saving meal log:`, error);
+      return undefined;
+    }
   }
 
   private hasMedia(message: WAMessage): boolean {
@@ -462,7 +531,14 @@ export class WhatsAppService {
     );
   }
 
-  private formatMacroResponse(data: MacroEstimate): string {
+  private formatMacroResponse(data: MacroEstimate, saved?: boolean): string {
+    const saveStatus =
+      saved === undefined
+        ? ''
+        : saved
+          ? '\n✅ *Saved to your meal log.*'
+          : '\n⚠️ *Nutrition estimated, but Supabase save failed.*';
+
     return (
       '🍽️ *Nutrient Log Verified!*\n' +
       '━━━━━━━━━━━━━━━━━━\n' +
@@ -471,7 +547,8 @@ export class WhatsAppService {
       `💪 *Protein:* ${data.protein}g\n` +
       `🍞 *Karbohidrat:* ${data.carbs}g\n` +
       `🥗 *Serat:* ${data.fiber}g\n` +
-      '━━━━━━━━━━━━━━━━━━'
+      '━━━━━━━━━━━━━━━━━━' +
+      saveStatus
     );
   }
 

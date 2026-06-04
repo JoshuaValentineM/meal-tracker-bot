@@ -59,6 +59,10 @@ export class AIService {
     return this.client !== null;
   }
 
+  getModelName(): string {
+    return this.model;
+  }
+
   async analyzeTextPayload(input: string): Promise<MacroEstimate> {
     return this.wrapModelCall(async () => {
       const client = this.getClient();

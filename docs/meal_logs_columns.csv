@@ -1,0 +1,2 @@
+id,created_at,group_jid,group_name,sender_jid,sender_name,message_id,source_type,input_text,food_name,calories,protein_g,carbs_g,fiber_g,ai_model,raw_estimate_json,notes,deleted_at
+00000000-0000-0000-0000-000000000001,2026-06-04T12:00:00+07:00,120363000000000000@g.us,Our Food Journal,6281234567890@s.whatsapp.net,Joshua,ABCDEF123456,text,150g dada ayam panggang,Dada ayam panggang,250,45,0,0,gemini-2.5-flash-lite,"{""foodName"":""Dada ayam panggang"",""calories"":250,""protein"":45,""carbs"":0,""fiber"":0}",Sample row. Delete after table creation.,

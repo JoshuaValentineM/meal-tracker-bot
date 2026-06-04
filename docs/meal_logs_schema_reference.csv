@@ -1,0 +1,19 @@
+column_name,data_type,nullable,default_value,primary_key,description
+id,uuid,false,gen_random_uuid(),true,Primary key for each meal log.
+created_at,timestamptz,false,now(),false,When the meal log was created.
+group_jid,text,false,,false,WhatsApp group JID where the meal was logged.
+group_name,text,true,,false,Human-readable WhatsApp group name if available.
+sender_jid,text,false,,false,WhatsApp sender JID.
+sender_name,text,true,,false,Sender display name or push name if available.
+message_id,text,true,,false,Original WhatsApp message ID for traceability and undo.
+source_type,text,false,,false,Input source: text or image.
+input_text,text,true,,false,Original text command or image caption.
+food_name,text,false,,false,Food name returned by AI.
+calories,int4,false,,false,Estimated calories in kcal.
+protein_g,int4,false,,false,Estimated protein in grams.
+carbs_g,int4,false,,false,Estimated carbohydrates in grams.
+fiber_g,int4,false,,false,Estimated fiber in grams.
+ai_model,text,true,,false,Gemini model used for this estimate.
+raw_estimate_json,jsonb,true,,false,Raw structured AI estimate for future debugging.
+notes,text,true,,false,Optional notes or correction context.
+deleted_at,timestamptz,true,,false,Soft delete timestamp for undo without losing audit history.
