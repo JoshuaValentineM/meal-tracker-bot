@@ -10,7 +10,7 @@ dist/
 !.env.example
 
 # whatsapp local session/cache
-.baileys_auth/
+.baileys_auth*/
 .wwebjs_auth/
 .wwebjs_cache/
 
@@ -25,4 +25,3 @@ npm-debug.log*
 docs/PROJECT_CONTEXT_AND_CHAT_HISTORY.md
 docs/FREE_DEPLOYMENT_GUIDE.md
 docs/RENDER_DEPLOYMENT_PLAN.md
-

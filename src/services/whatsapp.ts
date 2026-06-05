@@ -16,7 +16,9 @@ import qrcode from 'qrcode-terminal';
 import pino from 'pino';
 import { AIService, AIServiceError, MacroEstimate } from './ai.js';
 import { MealLogService } from './mealLog.js';
+import { NutritionTargetService } from './nutritionTarget.js';
 import type { MealLog, MealSourceType } from '../types/meal-log.js';
+import type { NutritionTarget, NutritionTargetField, NutritionTargetValues } from '../types/nutrition-target.js';
 
 type ContextInfoCarrier = {
   text?: string | null;
@@ -24,10 +26,30 @@ type ContextInfoCarrier = {
   contextInfo?: proto.IContextInfo | null;
 };
 
+type MacroTotals = {
+  calories: number;
+  protein: number;
+  carbs: number;
+  fiber: number;
+};
+
+type ParticipantIdentity = {
+  jid: string;
+  displayName?: string;
+  keys: Set<string>;
+};
+
+type TargetCommand =
+  | { action: 'show' }
+  | { action: 'clearAll' }
+  | { action: 'clearFields'; fields: NutritionTargetField[] }
+  | { action: 'update'; values: NutritionTargetValues };
+
 export class WhatsAppService {
   private socket: WASocket | null;
   private readonly aiService: AIService;
   private readonly mealLogService: MealLogService;
+  private readonly nutritionTargetService: NutritionTargetService;
   private readonly logger;
   private readonly triggerAliases: string[];
   private readonly targetGroupName: string | null;
@@ -43,6 +65,7 @@ export class WhatsAppService {
     this.socket = null;
     this.aiService = new AIService();
     this.mealLogService = new MealLogService();
+    this.nutritionTargetService = new NutritionTargetService();
     this.logger = pino({ level: 'silent' });
     this.triggerAliases = this.loadTriggerAliases();
     this.targetGroupName = process.env.TARGET_GROUP_NAME?.trim() || null;
@@ -68,6 +91,7 @@ export class WhatsAppService {
       targetGroupName: this.targetGroupName,
       triggerAliases: this.triggerAliases,
       mealLogStorageConfigured: this.mealLogService.isConfigured(),
+      targetStorageConfigured: this.nutritionTargetService.isConfigured(),
       lastOpenAt: this.lastOpenAt,
       lastCloseAt: this.lastCloseAt,
       lastMessageAt: this.lastMessageAt,
@@ -202,6 +226,31 @@ export class WhatsAppService {
 
     const command = commandText.split(/\s+/)[0]?.toLowerCase() || '';
 
+    if (command === '!today') {
+      await this.handleTodayCommand(message);
+      return;
+    }
+
+    if (command === '!history') {
+      await this.handleHistoryCommand(message);
+      return;
+    }
+
+    if (command === '!undo') {
+      await this.handleUndoCommand(message);
+      return;
+    }
+
+    if (command === '!summary') {
+      await this.handleSummaryCommand(message);
+      return;
+    }
+
+    if (command === '!target') {
+      await this.handleTargetCommand(message, commandText.replace(/!target/i, '').trim());
+      return;
+    }
+
     if (hasMedia && command !== '!help') {
       await this.handleMentionedMediaMessage(message);
       return;
@@ -284,6 +333,134 @@ export class WhatsAppService {
         message,
         this.getFriendlyErrorMessage(error, '❌ Ups, fotonya belum berhasil diproses. Coba kirim ulang dengan gambar yang lebih jelas.')
       );
+    }
+  }
+
+  private async handleTodayCommand(message: WAMessage): Promise<void> {
+    const senderJid = this.getSenderJid(message);
+    if (!senderJid) {
+      await this.reply(message, '❌ Tidak bisa membaca identitas pengirim untuk menghitung total hari ini.');
+      return;
+    }
+
+    try {
+      const { startIso, endIso } = this.getTodayRange();
+      const logs = await this.mealLogService.getMealLogsForDateRange(startIso, endIso);
+      const senderLogs = this.filterLogsByPerson(logs, senderJid);
+      const totals = this.calculateTotals(senderLogs);
+      const target = await this.getTargetForToday(senderJid);
+
+      await this.reply(message, this.formatTodayResponse(senderLogs, totals, target));
+    } catch (error) {
+      console.error('Failed to handle !today command:', error);
+      await this.reply(message, this.getMealLogCommandErrorMessage());
+    }
+  }
+
+  private async handleTargetCommand(message: WAMessage, targetText: string): Promise<void> {
+    const senderJid = this.getSenderJid(message);
+    if (!senderJid) {
+      await this.reply(message, '❌ Tidak bisa membaca identitas pengirim untuk mengatur target.');
+      return;
+    }
+
+    try {
+      const parsed = this.parseTargetCommand(targetText);
+      if (!parsed) {
+        await this.reply(message, this.getTargetUsageMessage());
+        return;
+      }
+
+      if (parsed.action === 'show') {
+        const target = await this.nutritionTargetService.getTarget(senderJid);
+        await this.reply(message, this.formatTargetResponse(target));
+        return;
+      }
+
+      if (parsed.action === 'clearAll') {
+        await this.nutritionTargetService.clearTarget(senderJid, new Date().toISOString());
+        await this.reply(message, '🧹 *Daily target cleared*\n━━━━━━━━━━━━━━━━━━\nSemua target harian kamu sudah dihapus.');
+        return;
+      }
+
+      if (parsed.action === 'clearFields') {
+        const clearValues = Object.fromEntries(parsed.fields.map((field) => [field, null])) as NutritionTargetValues;
+        const target = await this.nutritionTargetService.clearTargetFields(senderJid, clearValues);
+        await this.reply(message, this.formatTargetUpdateResponse(target, '✅ Daily target updated'));
+        return;
+      }
+
+      const target = await this.nutritionTargetService.upsertTarget(
+        senderJid,
+        message.pushName?.trim() || undefined,
+        parsed.values
+      );
+      await this.reply(message, this.formatTargetUpdateResponse(target, '✅ Daily target updated'));
+    } catch (error) {
+      console.error('Failed to handle !target command:', error);
+      await this.reply(message, this.getTargetCommandErrorMessage());
+    }
+  }
+
+  private async handleHistoryCommand(message: WAMessage): Promise<void> {
+    const senderJid = this.getSenderJid(message);
+    if (!senderJid) {
+      await this.reply(message, '❌ Tidak bisa membaca identitas pengirim untuk mengambil history.');
+      return;
+    }
+
+    try {
+      const logs = await this.mealLogService.getRecentMealLogs(100);
+      const senderLogs = this.filterLogsByPerson(logs, senderJid).slice(0, 5);
+
+      await this.reply(message, this.formatHistoryResponse(senderLogs));
+    } catch (error) {
+      console.error('Failed to handle !history command:', error);
+      await this.reply(message, this.getMealLogCommandErrorMessage());
+    }
+  }
+
+  private async handleUndoCommand(message: WAMessage): Promise<void> {
+    const senderJid = this.getSenderJid(message);
+    if (!senderJid) {
+      await this.reply(message, '❌ Tidak bisa membaca identitas pengirim untuk undo log terakhir.');
+      return;
+    }
+
+    try {
+      const logs = await this.mealLogService.getRecentMealLogs(100);
+      const latestLog = this.filterLogsByPerson(logs, senderJid)[0];
+
+      if (!latestLog?.id) {
+        await this.reply(message, '↩️ Belum ada meal log yang bisa di-undo.');
+        return;
+      }
+
+      await this.mealLogService.softDeleteMealLog(latestLog.id, new Date().toISOString());
+      await this.reply(message, this.formatUndoResponse(latestLog));
+    } catch (error) {
+      console.error('Failed to handle !undo command:', error);
+      await this.reply(message, this.getMealLogCommandErrorMessage());
+    }
+  }
+
+  private async handleSummaryCommand(message: WAMessage): Promise<void> {
+    const groupJid = this.normalizeJid(message.key.remoteJid);
+    if (!groupJid) {
+      await this.reply(message, '❌ Tidak bisa membaca grup untuk membuat summary.');
+      return;
+    }
+
+    try {
+      const participants = await this.getGroupParticipantIdentities(groupJid);
+      const { startIso, endIso } = this.getTodayRange();
+      const logs = await this.mealLogService.getMealLogsForDateRange(startIso, endIso);
+      const summary = this.buildParticipantSummary(logs, participants);
+
+      await this.reply(message, this.formatSummaryResponse(summary));
+    } catch (error) {
+      console.error('Failed to handle !summary command:', error);
+      await this.reply(message, this.getMealLogCommandErrorMessage());
     }
   }
 
@@ -419,6 +596,408 @@ export class WhatsAppService {
     }
   }
 
+  private async getGroupParticipantIdentities(groupJid: string): Promise<ParticipantIdentity[]> {
+    const metadata = await this.socket?.groupMetadata(groupJid);
+    const botKeys = new Set(this.botJids.flatMap((jid) => this.getComparableIdKeys(jid)));
+
+    return (metadata?.participants || [])
+      .map((participant) => {
+        const rawParticipant = participant as {
+          id?: string | null;
+          jid?: string | null;
+          lid?: string | null;
+          phoneNumber?: string | null;
+        };
+        const jid = this.normalizeJid(rawParticipant.id || rawParticipant.jid || rawParticipant.lid || null);
+        const phoneJid = this.normalizeJid(
+          rawParticipant.phoneNumber ? `${rawParticipant.phoneNumber}@s.whatsapp.net` : null
+        );
+        const keys = new Set([
+          ...this.getComparableIdKeys(jid),
+          ...this.getComparableIdKeys(phoneJid),
+        ]);
+
+        if (!jid || this.hasAnyMatchingKey(keys, botKeys)) {
+          return null;
+        }
+
+        return { jid, keys };
+      })
+      .filter(Boolean) as ParticipantIdentity[];
+  }
+
+  private getSenderJid(message: WAMessage): string | null {
+    return this.normalizeJid(message.key.participant || message.participant || null);
+  }
+
+  private filterLogsByPerson(logs: MealLog[], personJid: string): MealLog[] {
+    const personKeys = new Set(this.getComparableIdKeys(personJid));
+    return logs.filter((log) => this.hasAnyMatchingKey(new Set(this.getComparableIdKeys(log.senderJid)), personKeys));
+  }
+
+  private buildParticipantSummary(
+    logs: MealLog[],
+    participants: ParticipantIdentity[]
+  ): Array<{ displayName: string; totals: MacroTotals; count: number }> {
+    const summaries = new Map<string, { displayName: string; totals: MacroTotals; count: number }>();
+
+    for (const log of logs) {
+      const logKeys = new Set(this.getComparableIdKeys(log.senderJid));
+      const participant = participants.find((candidate) => this.hasAnyMatchingKey(logKeys, candidate.keys));
+
+      if (!participant) {
+        continue;
+      }
+
+      const existing = summaries.get(participant.jid) || {
+        displayName: log.senderName?.trim() || this.formatShortJid(participant.jid),
+        totals: this.emptyTotals(),
+        count: 0,
+      };
+
+      existing.displayName = log.senderName?.trim() || existing.displayName;
+      existing.totals = this.addTotals(existing.totals, log);
+      existing.count += 1;
+      summaries.set(participant.jid, existing);
+    }
+
+    return [...summaries.values()].sort((a, b) => b.totals.calories - a.totals.calories);
+  }
+
+  private calculateTotals(logs: MealLog[]): MacroTotals {
+    return logs.reduce((totals, log) => this.addTotals(totals, log), this.emptyTotals());
+  }
+
+  private addTotals(totals: MacroTotals, log: MealLog): MacroTotals {
+    return {
+      calories: totals.calories + log.calories,
+      protein: totals.protein + log.protein,
+      carbs: totals.carbs + log.carbs,
+      fiber: totals.fiber + log.fiber,
+    };
+  }
+
+  private emptyTotals(): MacroTotals {
+    return {
+      calories: 0,
+      protein: 0,
+      carbs: 0,
+      fiber: 0,
+    };
+  }
+
+  private hasAnyMatchingKey(left: Set<string>, right: Set<string>): boolean {
+    for (const key of left) {
+      if (right.has(key)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private getTodayRange(): { startIso: string; endIso: string } {
+    const jakartaOffsetMs = 7 * 60 * 60 * 1000;
+    const localNow = new Date(Date.now() + jakartaOffsetMs);
+    const startUtcMs =
+      Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), localNow.getUTCDate()) - jakartaOffsetMs;
+    const endUtcMs = startUtcMs + 24 * 60 * 60 * 1000;
+
+    return {
+      startIso: new Date(startUtcMs).toISOString(),
+      endIso: new Date(endUtcMs).toISOString(),
+    };
+  }
+
+  private formatTodayResponse(logs: MealLog[], totals: MacroTotals, target: NutritionTarget | null): string {
+    const targetHint = this.hasTargetValues(target)
+      ? ''
+      : '\n_Set target dengan: `@bot !target protein 120 calories 2000`_';
+
+    if (logs.length === 0 && !this.hasTargetValues(target)) {
+      return (
+        '📅 *Today so far*\n' +
+        '━━━━━━━━━━━━━━━━━━\n' +
+        'Belum ada meal log hari ini.\n' +
+        'Kirim `@bot !log nasi ayam` untuk mulai tracking.\n' +
+        '_Set target dengan: `@bot !target protein 120 calories 2000`_'
+      );
+    }
+
+    return (
+      '📅 *Today so far*\n' +
+      '━━━━━━━━━━━━━━━━━━\n' +
+      `🍽️ *Logs:* ${logs.length}\n` +
+      this.formatTodayMacroLines(totals, target).join('\n') +
+      '\n' +
+      '━━━━━━━━━━━━━━━━━━\n' +
+      '_Dihitung dari semua grup tempat kamu log hari ini._' +
+      targetHint
+    );
+  }
+
+  private formatTodayMacroLines(totals: MacroTotals, target: NutritionTarget | null): string[] {
+    return [
+      this.formatTodayMacroLine('🔥', 'Kalori', totals.calories, target?.calories, 'kcal'),
+      this.formatTodayMacroLine('💪', 'Protein', totals.protein, target?.protein, 'g'),
+      this.formatTodayMacroLine('🍞', 'Karbohidrat', totals.carbs, target?.carbs, 'g'),
+      this.formatTodayMacroLine('🥗', 'Serat', totals.fiber, target?.fiber, 'g'),
+    ];
+  }
+
+  private formatTodayMacroLine(
+    icon: string,
+    label: string,
+    current: number,
+    target: number | null | undefined,
+    unit: string
+  ): string {
+    if (target === null || target === undefined) {
+      return `${icon} *${label}:* ${current}${unit === 'kcal' ? ` ${unit}` : unit}`;
+    }
+
+    return `${icon} *${label}:* ${current} / ${target}${unit === 'kcal' ? ` ${unit}` : unit}`;
+  }
+
+  private formatHistoryResponse(logs: MealLog[]): string {
+    if (logs.length === 0) {
+      return '📜 *Recent meal logs*\n━━━━━━━━━━━━━━━━━━\nBelum ada meal log yang tersimpan.';
+    }
+
+    const rows = logs.map((log, index) => {
+      return (
+        `${index + 1}. *${log.foodName}*\n` +
+        `   ${this.formatMealLogTimestamp(log.createdAt)} · ${log.calories} kcal · P ${log.protein}g · C ${log.carbs}g · F ${log.fiber}g`
+      );
+    });
+
+    return '📜 *Recent meal logs*\n━━━━━━━━━━━━━━━━━━\n' + rows.join('\n\n');
+  }
+
+  private formatUndoResponse(log: MealLog): string {
+    return (
+      '↩️ *Last meal log undone*\n' +
+      '━━━━━━━━━━━━━━━━━━\n' +
+      `📝 *Menu:* ${log.foodName}\n` +
+      `🔥 *Kalori:* ${log.calories} kcal\n` +
+      `💪 *Protein:* ${log.protein}g\n` +
+      `🍞 *Karbohidrat:* ${log.carbs}g\n` +
+      `🥗 *Serat:* ${log.fiber}g`
+    );
+  }
+
+  private formatSummaryResponse(
+    summaries: Array<{ displayName: string; totals: MacroTotals; count: number }>
+  ): string {
+    if (summaries.length === 0) {
+      return '📊 *Today summary*\n━━━━━━━━━━━━━━━━━━\nBelum ada meal log hari ini untuk anggota grup ini.';
+    }
+
+    const rows = summaries.map((summary) => {
+      return (
+        `*${summary.displayName}*\n` +
+        `🍽️ Logs: ${summary.count}\n` +
+        `🔥 ${summary.totals.calories} kcal\n` +
+        `💪 Protein ${summary.totals.protein}g\n` +
+        `🍞 Karbohidrat ${summary.totals.carbs}g\n` +
+        `🥗 Serat ${summary.totals.fiber}g`
+      );
+    });
+
+    return (
+      '📊 *Today summary*\n' +
+      '━━━━━━━━━━━━━━━━━━\n' +
+      rows.join('\n\n') +
+      '\n━━━━━━━━━━━━━━━━━━\n' +
+      '_Hanya anggota grup ini, tapi log dihitung dari semua grup._'
+    );
+  }
+
+  private formatMealLogTimestamp(value: string): string {
+    return new Intl.DateTimeFormat('id-ID', {
+      timeZone: 'Asia/Jakarta',
+      day: '2-digit',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(value));
+  }
+
+  private formatShortJid(jid: string): string {
+    return jid.split('@')[0].split(':')[0];
+  }
+
+  private getMealLogCommandErrorMessage(): string {
+    if (!this.mealLogService.isConfigured()) {
+      return '❌ Supabase belum dikonfigurasi. Tambahkan `SUPABASE_URL` dan `SUPABASE_SERVICE_ROLE_KEY`.';
+    }
+
+    return '❌ Gagal membaca meal log dari Supabase. Coba lagi sebentar ya.';
+  }
+
+  private async getTargetForToday(senderJid: string): Promise<NutritionTarget | null> {
+    try {
+      return await this.nutritionTargetService.getTarget(senderJid);
+    } catch (error) {
+      console.error('Failed to load nutrition target for !today:', error);
+      return null;
+    }
+  }
+
+  private parseTargetCommand(text: string): TargetCommand | null {
+    const tokens = text.split(/\s+/).map((token) => token.trim()).filter(Boolean);
+
+    if (tokens.length === 0) {
+      return { action: 'show' };
+    }
+
+    if (tokens[0]?.toLowerCase() === 'clear') {
+      if (tokens.length === 1) {
+        return { action: 'clearAll' };
+      }
+
+      const fields = tokens.slice(1).map((token) => this.normalizeTargetField(token));
+      if (fields.some((field) => field === null)) {
+        return null;
+      }
+
+      return { action: 'clearFields', fields: [...new Set(fields as NutritionTargetField[])] };
+    }
+
+    if (tokens.length % 2 !== 0) {
+      return null;
+    }
+
+    const values: NutritionTargetValues = {};
+    const seenFields = new Set<NutritionTargetField>();
+
+    for (let index = 0; index < tokens.length; index += 2) {
+      const field = this.normalizeTargetField(tokens[index]);
+      const value = this.parsePositiveInteger(tokens[index + 1]);
+
+      if (!field || value === null || seenFields.has(field)) {
+        return null;
+      }
+
+      values[field] = value;
+      seenFields.add(field);
+    }
+
+    return seenFields.size > 0 ? { action: 'update', values } : null;
+  }
+
+  private normalizeTargetField(value: string | undefined): NutritionTargetField | null {
+    const normalized = value?.toLowerCase();
+
+    if (!normalized) {
+      return null;
+    }
+
+    if (['calories', 'calorie', 'kalori', 'cal'].includes(normalized)) {
+      return 'calories';
+    }
+
+    if (['protein', 'proteins', 'p'].includes(normalized)) {
+      return 'protein';
+    }
+
+    if (['carbs', 'carb', 'karbo', 'karbohidrat', 'c'].includes(normalized)) {
+      return 'carbs';
+    }
+
+    if (['fiber', 'fibre', 'serat', 'f'].includes(normalized)) {
+      return 'fiber';
+    }
+
+    return null;
+  }
+
+  private parsePositiveInteger(value: string | undefined): number | null {
+    if (!value || !/^[1-9]\d*$/.test(value)) {
+      return null;
+    }
+
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+
+  private formatTargetResponse(target: NutritionTarget | null): string {
+    if (!this.hasTargetValues(target)) {
+      return (
+        '🎯 *Daily target*\n' +
+        '━━━━━━━━━━━━━━━━━━\n' +
+        'Belum ada target harian.\n' +
+        'Set dengan: `@bot !target protein 120 calories 2000`'
+      );
+    }
+
+    return '🎯 *Daily target*\n━━━━━━━━━━━━━━━━━━\n' + this.formatTargetLines(target).join('\n');
+  }
+
+  private formatTargetUpdateResponse(target: NutritionTarget | null, title: string): string {
+    if (!this.hasTargetValues(target)) {
+      return (
+        `${title}\n` +
+        '━━━━━━━━━━━━━━━━━━\n' +
+        'Belum ada target aktif.\n' +
+        'Set dengan: `@bot !target protein 120 calories 2000`'
+      );
+    }
+
+    return `${title}\n━━━━━━━━━━━━━━━━━━\n` + this.formatTargetLines(target).join('\n');
+  }
+
+  private formatTargetLines(target: NutritionTarget): string[] {
+    const lines: string[] = [];
+
+    if (target.calories !== null && target.calories !== undefined) {
+      lines.push(`🔥 *Kalori:* ${target.calories} kcal`);
+    }
+
+    if (target.protein !== null && target.protein !== undefined) {
+      lines.push(`💪 *Protein:* ${target.protein}g`);
+    }
+
+    if (target.carbs !== null && target.carbs !== undefined) {
+      lines.push(`🍞 *Karbohidrat:* ${target.carbs}g`);
+    }
+
+    if (target.fiber !== null && target.fiber !== undefined) {
+      lines.push(`🥗 *Serat:* ${target.fiber}g`);
+    }
+
+    return lines;
+  }
+
+  private hasTargetValues(target: NutritionTarget | null | undefined): target is NutritionTarget {
+    return Boolean(
+      target &&
+        [target.calories, target.protein, target.carbs, target.fiber].some((value) => value !== null && value !== undefined)
+    );
+  }
+
+  private getTargetUsageMessage(): string {
+    return (
+      '❌ *Format target belum valid*\n' +
+      '━━━━━━━━━━━━━━━━━━\n' +
+      'Contoh:\n' +
+      '• `@bot !target`\n' +
+      '• `@bot !target protein 120 calories 2000`\n' +
+      '• `@bot !target carbs 220 fiber 25`\n' +
+      '• `@bot !target clear protein`\n' +
+      '• `@bot !target clear`\n\n' +
+      'Nilai harus angka bulat positif.'
+    );
+  }
+
+  private getTargetCommandErrorMessage(): string {
+    if (!this.nutritionTargetService.isConfigured()) {
+      return '❌ Supabase belum dikonfigurasi. Tambahkan `SUPABASE_URL` dan `SUPABASE_SERVICE_ROLE_KEY`.';
+    }
+
+    return '❌ Gagal membaca atau menyimpan target dari Supabase. Pastikan tabel `nutrition_targets` sudah dibuat.';
+  }
+
   private hasMedia(message: WAMessage): boolean {
     return Boolean(this.extractMimeType(message));
   }
@@ -522,6 +1101,16 @@ export class WhatsAppService {
       'Menampilkan panduan dan daftar command.\n\n' +
       '• `@bot !log nasi ayam`\n' +
       'Analisis log makanan dari teks.\n\n' +
+      '• `@bot !today`\n' +
+      'Lihat total nutrisi kamu hari ini dari semua grup.\n\n' +
+      '• `@bot !history`\n' +
+      'Lihat 5 meal log terakhirmu.\n\n' +
+      '• `@bot !undo`\n' +
+      'Undo meal log terakhirmu.\n\n' +
+      '• `@bot !summary`\n' +
+      'Lihat summary hari ini per orang untuk anggota grup ini.\n\n' +
+      '• `@bot !target protein 120 calories 2000`\n' +
+      'Set, lihat, atau clear target harian personal.\n\n' +
       '• Mention bot + kirim foto\n' +
       'Analisis makanan dari foto. `!log` di caption bersifat opsional.\n\n' +
       'Contoh:\n' +

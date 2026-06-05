@@ -7,6 +7,8 @@ This file explains how the bot works today so future agents can change it withou
 - Main startup file: `src/index.ts`
 - Main WhatsApp logic: `src/services/whatsapp.ts`
 - Gemini nutrition service: `src/services/ai.ts`
+- Supabase meal log service: `src/services/mealLog.ts`
+- Meal log domain types: `src/types/meal-log.ts`
 
 ## High-Level Flow
 
@@ -16,6 +18,8 @@ This file explains how the bot works today so future agents can change it withou
 4. `WhatsAppService.initialize()` starts a Baileys socket connection.
 5. The bot listens for Baileys connection events and `messages.upsert`.
 6. When a supported group message calls the bot, it routes the message into text or image nutrition analysis.
+7. After Gemini returns macros, the bot saves a structured meal log to Supabase.
+8. The bot replies in WhatsApp with the macro estimate and a save status.
 
 ## WhatsApp Authentication Flow
 
@@ -167,9 +171,91 @@ Behavior:
 
 - strips the command prefix
 - sends the remaining text to Gemini
-- replies with structured macro output
+- saves the resulting macro estimate to Supabase `meal_logs`
+- replies with structured macro output plus a save confirmation or save warning
 
 If no food text is provided, the bot replies with a usage hint.
+
+### `!today`
+
+Example:
+
+```text
+@Meal Tracker BOT !today
+```
+
+Behavior:
+
+- reads today's non-deleted meal logs for the sender
+- totals calories, protein, carbs, and fiber
+- counts the sender's logs across all groups, not only the current group
+- uses the Asia/Jakarta day boundary for "today"
+
+### `!history`
+
+Example:
+
+```text
+@Meal Tracker BOT !history
+```
+
+Behavior:
+
+- reads the sender's recent non-deleted meal logs across all groups
+- replies with the latest 5 logs
+- includes timestamp, food name, calories, protein, carbs, and fiber
+
+### `!undo`
+
+Example:
+
+```text
+@Meal Tracker BOT !undo
+```
+
+Behavior:
+
+- finds the sender's most recent non-deleted meal log across all groups
+- soft-deletes it by setting `deleted_at`
+- does not permanently delete the row from Supabase
+
+### `!summary`
+
+Example:
+
+```text
+@Meal Tracker BOT !summary
+```
+
+Behavior:
+
+- loads the current WhatsApp group participants
+- reads today's non-deleted meal logs across all groups
+- shows totals split by person for current-group participants only
+- does not show unrelated people from other groups
+- uses the Asia/Jakarta day boundary for "today"
+
+### `!target`
+
+Examples:
+
+```text
+@Meal Tracker BOT !target
+@Meal Tracker BOT !target protein 120 calories 2000
+@Meal Tracker BOT !target clear protein
+@Meal Tracker BOT !target clear
+```
+
+Behavior:
+
+- stores persistent personal daily nutrition targets in Supabase `nutrition_targets`
+- targets are per sender, not per group
+- an empty `!target` command shows the sender's active target
+- key-value pairs update only the provided fields
+- `clear` soft-clears the whole target row by setting `deleted_at`
+- `clear protein` or other listed fields set those target fields to `null`
+- accepted fields include calories, protein, carbs, and fiber aliases
+- values must be positive whole numbers
 
 ## Photo Behavior
 
@@ -195,6 +281,7 @@ Behavior:
 - it downloads the image using Baileys `downloadMediaMessage(...)`
 - converts the media buffer to base64
 - sends it into Gemini
+- saves the resulting macro estimate to Supabase `meal_logs`
 - replies with estimated food name, calories, protein, carbs, and fiber
 
 Important nuance:
@@ -223,6 +310,73 @@ Structured fields returned:
 - `protein`
 - `carbs`
 - `fiber`
+
+## Meal Log Persistence
+
+Successful text and photo analyses are now persisted to Supabase through `src/services/mealLog.ts`.
+
+Storage configuration:
+
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+The service writes to the `meal_logs` table through Supabase REST. It uses the service role key because this bot is a trusted server-side worker, not browser/client code.
+
+App-level meal logs use camelCase fields in `MealLog`, then map to snake_case database columns in `MealLogRow`.
+
+Important saved fields:
+
+- `id`
+- `created_at`
+- `group_jid`
+- `group_name`
+- `sender_jid`
+- `sender_name`
+- `message_id`
+- `source_type`
+- `input_text`
+- `food_name`
+- `calories`
+- `protein_g`
+- `carbs_g`
+- `fiber_g`
+- `ai_model`
+- `raw_estimate_json`
+- `deleted_at`
+
+The app currently generates UUIDs before insert. This keeps inserts working even if the Supabase table does not have a database-side default for `id`.
+
+If Supabase saving fails after Gemini succeeds, the bot still replies with the nutrition estimate but includes a warning instead of a saved confirmation.
+
+## Daily Target Persistence
+
+Personal daily targets are persisted to Supabase through `src/services/nutritionTarget.ts`.
+
+Storage configuration reuses:
+
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+Schema reference:
+
+- `docs/nutrition_targets_schema_reference.sql`
+
+Important saved fields:
+
+- `id`
+- `created_at`
+- `updated_at`
+- `sender_jid`
+- `sender_name`
+- `calories`
+- `protein_g`
+- `carbs_g`
+- `fiber_g`
+- `deleted_at`
+
+Targets persist until changed or cleared. Daily progress resets naturally because `!today` only totals meal logs within the current Asia/Jakarta day.
+
+When a target exists, `!today` renders configured fields as `current / target`. Unset fields are still shown as current totals without a target comparison.
 
 ## Gemini Model Configuration
 
@@ -279,6 +433,13 @@ Successful nutrition replies are formatted like this:
 🍞 Karbohidrat: ...g
 🥗 Serat: ...g
 ━━━━━━━━━━━━━━━━━━
+✅ Saved to your meal log.
+```
+
+If Gemini succeeds but Supabase saving fails, the final line is:
+
+```text
+⚠️ Nutrition estimated, but Supabase save failed.
 ```
 
 ## Current Environment Variables
@@ -287,8 +448,11 @@ Known variables used now:
 
 - `GEMINI_API_KEY`
 - `GEMINI_MODEL`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
 - `BOT_TRIGGER_ALIASES`
 - `TARGET_GROUP_NAME`
+- `BAILEYS_AUTH_DIR`
 - `SESSION_CREDS_JSON`
 
 Example:
@@ -296,8 +460,11 @@ Example:
 ```env
 GEMINI_API_KEY=your_gemini_api_key_here
 GEMINI_MODEL=gemini-2.5-flash-lite
+SUPABASE_URL=your_supabase_project_url_here
+SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key_here
 BOT_TRIGGER_ALIASES=Meal Tracker BOT
 TARGET_GROUP_NAME=
+BAILEYS_AUTH_DIR=.baileys_auth
 SESSION_CREDS_JSON=
 ```
 
@@ -327,7 +494,7 @@ The repo now includes:
 Ignored local-only artifacts:
 
 - `.env`
-- `.baileys_auth/`
+- `.baileys_auth*/`
 - `.wwebjs_auth/`
 - `.wwebjs_cache/`
 - `dist/`
@@ -338,8 +505,8 @@ Ignored local-only artifacts:
 
 Current limitations still in place:
 
-- no database or persistent nutrition log storage yet
-- no daily goal tracking yet
+- meal logs, personal daily totals, history, undo, and group-participant summaries are implemented
+- daily target tracking is implemented, but weekly summaries are not
 - no dashboard yet
 - no direct-message support
 - nutrition output is still estimation, not verified food-label data
@@ -355,4 +522,4 @@ Before changing behavior, a future agent should check:
 3. Whether DM support should be added
 4. Whether image-only mention behavior should stay permissive
 5. Whether full auth persistence beyond `creds.json` should be implemented
-6. Whether the next milestone is database persistence, history, or daily summaries
+6. Whether the next milestone is weekly summaries, target refinements, or dashboard work
