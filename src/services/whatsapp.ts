@@ -1109,27 +1109,23 @@ export class WhatsAppService {
     return (
       '🤖 *Meal Tracker Bot Help*\n' +
       '━━━━━━━━━━━━━━━━━━\n' +
-      'Mention bot dulu dengan `@bot`, lalu pakai salah satu command ini:\n\n' +
-      '• `@bot !help`\n' +
-      'Menampilkan panduan dan daftar command.\n\n' +
-      '• `@bot !log nasi ayam`\n' +
-      'Analisis log makanan dari teks.\n\n' +
-      '• `@bot !today`\n' +
-      'Lihat total nutrisi kamu hari ini dari semua grup.\n\n' +
-      '• `@bot !history`\n' +
-      'Lihat 5 meal log terakhirmu.\n\n' +
-      '• `@bot !undo`\n' +
-      'Undo meal log terakhirmu.\n\n' +
-      '• `@bot !summary`\n' +
-      'Lihat summary hari ini per orang untuk anggota grup ini.\n\n' +
-      '• `@bot !target protein 120 calories 2000`\n' +
-      'Set, lihat, atau clear target harian personal.\n\n' +
-      '• Mention bot + kirim foto\n' +
-      'Analisis makanan dari foto. `!log` di caption bersifat opsional.\n\n' +
-      'Contoh:\n' +
-      '• `@bot !log 150g dada ayam panggang`\n' +
-      '• Kirim foto dengan caption `@bot`\n' +
-      '• Kirim foto dengan caption `@bot !log`'
+      'Mention `@bot` (atau awali pesan dengan nama bot).\n\n' +
+      '🍽️ *Log makanan*\n' +
+      '• `@bot !log nasi ayam` — analisis teks & simpan.\n' +
+      '• Kirim foto + caption `@bot` atau `@bot !log` — analisis foto & simpan.\n\n' +
+      '📊 *Log & ringkasan*\n' +
+      '• `@bot !today` — total kamu hari ini dari semua grup.\n' +
+      '• `@bot !history` — 5 log terakhirmu dari semua grup.\n' +
+      '• `@bot !undo` — batalkan log terakhirmu dari semua grup.\n' +
+      '• `@bot !summary` — total hari ini dari semua grup, khusus anggota grup ini.\n\n' +
+      '🎯 *Target harian personal*\n' +
+      '• `@bot !target` — lihat target.\n' +
+      '• `@bot !target protein 120 calories 2000` — set/update satu atau beberapa target.\n' +
+      '• `@bot !target clear protein carbs` — hapus target tertentu.\n' +
+      '• `@bot !target clear` — hapus semua target.\n' +
+      'Field: `calories`, `protein`, `carbs`, `fiber` (angka bulat positif).\n\n' +
+      'Alias field: `kalori`, `karbo`, `karbohidrat`, `serat`, `cal`, `p`, `c`, `f`.\n\n' +
+      '❓ `@bot !help` atau cukup `@bot` — tampilkan bantuan ini.'
     );
   }
 
