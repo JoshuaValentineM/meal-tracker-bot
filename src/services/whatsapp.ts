@@ -4,6 +4,7 @@ import makeWASocket, {
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
+  fetchLatestWaWebVersion,
   getContentType,
   normalizeMessageContent,
   proto,
@@ -104,6 +105,17 @@ export class WhatsAppService {
     this.injectSessionCredsIfNeeded();
 
     const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+    const { version, isLatest, error: versionError } = await fetchLatestWaWebVersion();
+
+    if (isLatest) {
+      console.log(`Using WhatsApp Web version ${version.join('.')}.`);
+    } else {
+      console.warn(
+        `Could not fetch the current WhatsApp Web version; falling back to ${version.join('.')}.`,
+        versionError
+      );
+    }
+
     const socket = makeWASocket({
       auth: state,
       browser: Browsers.macOS('Meal Tracker BOT'),
@@ -111,6 +123,7 @@ export class WhatsAppService {
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      version,
     });
 
     this.socket = socket;
