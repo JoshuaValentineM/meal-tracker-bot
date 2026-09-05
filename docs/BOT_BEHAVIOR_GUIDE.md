@@ -409,9 +409,24 @@ Current socket behavior:
 - uses `printQRInTerminal: false`
 - prints QR manually with `qrcode-terminal`
 - uses `Browsers.macOS('Meal Tracker BOT')`
-- reconnects automatically after most disconnects
-- waits 5 seconds before reconnecting
-- avoids reconnect storms with a reconnect guard
+- reconnects automatically after all disconnects except an explicit WhatsApp logout
+- retries indefinitely with capped exponential backoff: 5, 10, 20, 40, then 60 seconds
+- retries socket startup failures as well as established-connection failures
+- disposes replaced sockets and ignores stale events from older socket generations
+- exposes the retry attempt, scheduled-retry state, and relink requirement through `/status`
+
+### Keeping a Render Free Web Service Awake
+
+`.github/workflows/keep-render-awake.yml` sends an external HTTP request every 10 minutes so a
+Render Free Web Service does not reach its 15-minute idle timeout. Configure the GitHub repository
+secret `RENDER_KEEPALIVE_URL` with the service's public health URL, for example:
+
+```text
+https://your-service-name.onrender.com/
+```
+
+The workflow also supports a manual run from the GitHub Actions page. It is only needed when the
+deployed service is a Free Web Service; a paid Background Worker runs continuously without it.
 
 Media download behavior:
 

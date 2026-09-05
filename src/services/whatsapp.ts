@@ -46,6 +46,9 @@ type TargetCommand =
   | { action: 'clearFields'; fields: NutritionTargetField[] }
   | { action: 'update'; values: NutritionTargetValues };
 
+const RECONNECT_BASE_DELAY_MS = 5_000;
+const RECONNECT_MAX_DELAY_MS = 60_000;
+
 export class WhatsAppService {
   private socket: WASocket | null;
   private readonly aiService: AIService;
@@ -56,7 +59,10 @@ export class WhatsAppService {
   private readonly targetGroupName: string | null;
   private readonly authDir: string;
   private botJids: string[];
-  private reconnectInProgress: boolean;
+  private reconnectAttempt: number;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null;
+  private socketGeneration: number;
+  private socketStartInProgress: boolean;
   private connectionState: string;
   private lastOpenAt: string | null;
   private lastCloseAt: string | null;
@@ -72,7 +78,10 @@ export class WhatsAppService {
     this.targetGroupName = process.env.TARGET_GROUP_NAME?.trim() || null;
     this.authDir = process.env.BAILEYS_AUTH_DIR?.trim() || path.join(process.cwd(), '.baileys_auth');
     this.botJids = [];
-    this.reconnectInProgress = false;
+    this.reconnectAttempt = 0;
+    this.reconnectTimer = null;
+    this.socketGeneration = 0;
+    this.socketStartInProgress = false;
     this.connectionState = 'initializing';
     this.lastOpenAt = null;
     this.lastCloseAt = null;
@@ -96,59 +105,101 @@ export class WhatsAppService {
       lastOpenAt: this.lastOpenAt,
       lastCloseAt: this.lastCloseAt,
       lastMessageAt: this.lastMessageAt,
+      reconnectAttempt: this.reconnectAttempt,
+      reconnectScheduled: this.reconnectTimer !== null,
+      requiresRelink: this.connectionState === 'logged_out',
       uptimeSeconds: Math.round(process.uptime()),
     };
   }
 
   private async startSocket(): Promise<void> {
-    this.ensureAuthDirectory();
-    this.injectSessionCredsIfNeeded();
-
-    const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
-    const { version, isLatest, error: versionError } = await fetchLatestWaWebVersion();
-
-    if (isLatest) {
-      console.log(`Using WhatsApp Web version ${version.join('.')}.`);
-    } else {
-      console.warn(
-        `Could not fetch the current WhatsApp Web version; falling back to ${version.join('.')}.`,
-        versionError
-      );
+    if (this.socketStartInProgress) {
+      return;
     }
 
-    const socket = makeWASocket({
-      auth: state,
-      browser: Browsers.macOS('Meal Tracker BOT'),
-      logger: this.logger,
-      printQRInTerminal: false,
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
-      version,
-    });
+    this.socketStartInProgress = true;
+    this.clearReconnectTimer();
 
-    this.socket = socket;
-    this.botJids = this.extractBotJids(socket.user);
+    try {
+      await this.disposeSocket(this.socket);
 
-    socket.ev.on('creds.update', saveCreds);
-    socket.ev.on('connection.update', async (update) => {
-      await this.handleConnectionUpdate(update);
-    });
-    socket.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') {
-        return;
+      this.ensureAuthDirectory();
+      this.injectSessionCredsIfNeeded();
+
+      const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+      const { version, isLatest, error: versionError } = await fetchLatestWaWebVersion();
+
+      if (isLatest) {
+        console.log(`Using WhatsApp Web version ${version.join('.')}.`);
+      } else {
+        console.warn(
+          `Could not fetch the current WhatsApp Web version; falling back to ${version.join('.')}.`,
+          versionError
+        );
       }
 
-      for (const message of messages) {
-        try {
-          await this.handleIncomingMessage(message);
-        } catch (error) {
-          console.error('Error handling incoming message:', error);
+      const socket = makeWASocket({
+        auth: state,
+        browser: Browsers.macOS('Meal Tracker BOT'),
+        logger: this.logger,
+        printQRInTerminal: false,
+        markOnlineOnConnect: false,
+        syncFullHistory: false,
+        version,
+      });
+      const generation = ++this.socketGeneration;
+
+      this.socket = socket;
+      this.botJids = this.extractBotJids(socket.user);
+
+      socket.ev.on('creds.update', saveCreds);
+      socket.ev.on('connection.update', async (update) => {
+        if (!this.isCurrentSocket(socket, generation)) {
+          return;
         }
-      }
-    });
+
+        try {
+          await this.handleConnectionUpdate(update, socket, generation);
+        } catch (error) {
+          console.error('Error handling WhatsApp connection update:', error);
+          this.connectionState = 'close';
+          this.lastCloseAt = new Date().toISOString();
+          await this.disposeSocket(socket);
+          this.scheduleReconnect('connection update handler failed');
+        }
+      });
+      socket.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (!this.isCurrentSocket(socket, generation) || type !== 'notify') {
+          return;
+        }
+
+        for (const message of messages) {
+          try {
+            await this.handleIncomingMessage(message);
+          } catch (error) {
+            console.error('Error handling incoming message:', error);
+          }
+        }
+      });
+    } catch (error) {
+      this.connectionState = 'close';
+      this.lastCloseAt = new Date().toISOString();
+      console.error('Failed to start WhatsApp socket:', error);
+      this.scheduleReconnect('socket startup failed');
+    } finally {
+      this.socketStartInProgress = false;
+    }
   }
 
-  private async handleConnectionUpdate(update: Partial<ConnectionState>): Promise<void> {
+  private async handleConnectionUpdate(
+    update: Partial<ConnectionState>,
+    socket: WASocket,
+    generation: number
+  ): Promise<void> {
+    if (!this.isCurrentSocket(socket, generation)) {
+      return;
+    }
+
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -167,8 +218,9 @@ export class WhatsAppService {
     if (connection === 'open') {
       this.connectionState = 'open';
       this.lastOpenAt = new Date().toISOString();
-      this.reconnectInProgress = false;
-      this.botJids = this.extractBotJids(this.socket?.user);
+      this.reconnectAttempt = 0;
+      this.clearReconnectTimer();
+      this.botJids = this.extractBotJids(socket.user);
       console.log('\n🚀 Success! Meal Tracker Bot is officially online and listening!');
       console.log('Running on Baileys WebSocket transport.');
       console.log(
@@ -187,19 +239,74 @@ export class WhatsAppService {
       const statusCode = this.getDisconnectStatusCode(lastDisconnect?.error);
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-      console.error('WhatsApp connection closed:', lastDisconnect?.error);
+      console.error(`WhatsApp connection closed (status ${statusCode ?? 'unknown'}):`, lastDisconnect?.error);
+      await this.disposeSocket(socket, false);
 
       if (shouldReconnect) {
-        if (this.reconnectInProgress) {
-          return;
-        }
-
-        this.reconnectInProgress = true;
-        console.log('Reconnecting to WhatsApp...');
-        await this.delay(5000);
-        await this.startSocket();
+        this.scheduleReconnect(`disconnect status ${statusCode ?? 'unknown'}`);
       } else {
+        this.connectionState = 'logged_out';
+        this.reconnectAttempt = 0;
+        this.clearReconnectTimer();
         console.error('WhatsApp session logged out. Delete .baileys_auth and link again.');
+      }
+    }
+  }
+
+  private scheduleReconnect(reason: string): void {
+    if (this.reconnectTimer) {
+      return;
+    }
+
+    const delayMs = Math.min(
+      RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempt,
+      RECONNECT_MAX_DELAY_MS
+    );
+    this.reconnectAttempt += 1;
+    this.connectionState = 'reconnecting';
+    console.log(
+      `Reconnecting to WhatsApp in ${Math.round(delayMs / 1000)} seconds ` +
+        `(attempt ${this.reconnectAttempt}; ${reason})...`
+    );
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.startSocket();
+    }, delayMs);
+  }
+
+  private clearReconnectTimer(): void {
+    if (!this.reconnectTimer) {
+      return;
+    }
+
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private isCurrentSocket(socket: WASocket, generation: number): boolean {
+    return this.socket === socket && this.socketGeneration === generation;
+  }
+
+  private async disposeSocket(socket: WASocket | null, closeTransport = true): Promise<void> {
+    if (!socket) {
+      return;
+    }
+
+    socket.ev.removeAllListeners('connection.update');
+    socket.ev.removeAllListeners('messages.upsert');
+    socket.ev.removeAllListeners('creds.update');
+
+    if (this.socket === socket) {
+      this.socket = null;
+      this.botJids = [];
+    }
+
+    if (closeTransport) {
+      try {
+        await socket.end(undefined);
+      } catch (error) {
+        console.warn('Failed to close previous WhatsApp socket cleanly:', error);
       }
     }
   }
@@ -1205,9 +1312,4 @@ export class WhatsAppService {
     return maybeBoom.output?.statusCode ?? maybeBoom.statusCode;
   }
 
-  private async delay(ms: number): Promise<void> {
-    await new Promise((resolve) => {
-      setTimeout(resolve, ms);
-    });
-  }
 }
