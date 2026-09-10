@@ -6,6 +6,7 @@ import makeWASocket, {
   downloadMediaMessage,
   fetchLatestWaWebVersion,
   getContentType,
+  makeCacheableSignalKeyStore,
   normalizeMessageContent,
   proto,
   useMultiFileAuthState,
@@ -18,6 +19,7 @@ import pino from 'pino';
 import { AIService, AIServiceError, MacroEstimate } from './ai.js';
 import { MealLogService } from './mealLog.js';
 import { NutritionTargetService } from './nutritionTarget.js';
+import { SupabaseWhatsAppAuthStore } from './whatsappAuth.js';
 import type { MealLog, MealSourceType } from '../types/meal-log.js';
 import type { NutritionTarget, NutritionTargetField, NutritionTargetValues } from '../types/nutrition-target.js';
 
@@ -48,6 +50,9 @@ type TargetCommand =
 
 const RECONNECT_BASE_DELAY_MS = 5_000;
 const RECONNECT_MAX_DELAY_MS = 60_000;
+const CONNECTION_ATTEMPT_TIMEOUT_MS = 60_000;
+
+type WhatsAppAuthBackend = 'filesystem' | 'supabase';
 
 export class WhatsAppService {
   private socket: WASocket | null;
@@ -58,15 +63,22 @@ export class WhatsAppService {
   private readonly triggerAliases: string[];
   private readonly targetGroupName: string | null;
   private readonly authDir: string;
+  private readonly authBackend: WhatsAppAuthBackend;
+  private readonly supabaseAuthStore: SupabaseWhatsAppAuthStore | null;
   private botJids: string[];
   private reconnectAttempt: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null;
   private socketGeneration: number;
   private socketStartInProgress: boolean;
+  private connectionAttemptTimer: ReturnType<typeof setTimeout> | null;
   private connectionState: string;
+  private relinkRequired: boolean;
   private lastOpenAt: string | null;
   private lastCloseAt: string | null;
   private lastMessageAt: string | null;
+  private lastDisconnectCode: number | null;
+  private lastDisconnectMessage: string | null;
+  private qrGeneratedAt: string | null;
 
   constructor() {
     this.socket = null;
@@ -77,15 +89,23 @@ export class WhatsAppService {
     this.triggerAliases = this.loadTriggerAliases();
     this.targetGroupName = process.env.TARGET_GROUP_NAME?.trim() || null;
     this.authDir = process.env.BAILEYS_AUTH_DIR?.trim() || path.join(process.cwd(), '.baileys_auth');
+    this.authBackend = this.loadAuthBackend();
+    this.supabaseAuthStore =
+      this.authBackend === 'supabase' ? new SupabaseWhatsAppAuthStore() : null;
     this.botJids = [];
     this.reconnectAttempt = 0;
     this.reconnectTimer = null;
     this.socketGeneration = 0;
     this.socketStartInProgress = false;
+    this.connectionAttemptTimer = null;
     this.connectionState = 'initializing';
+    this.relinkRequired = false;
     this.lastOpenAt = null;
     this.lastCloseAt = null;
     this.lastMessageAt = null;
+    this.lastDisconnectCode = null;
+    this.lastDisconnectMessage = null;
+    this.qrGeneratedAt = null;
   }
 
   public async initialize(): Promise<void> {
@@ -93,6 +113,18 @@ export class WhatsAppService {
   }
 
   public getStatus(): Record<string, unknown> {
+    const authDiagnostics = this.supabaseAuthStore?.getDiagnostics() || {
+      authBackend: 'filesystem',
+      authSessionId: null,
+      authStateStored: fs.existsSync(path.join(this.authDir, 'creds.json')),
+      authRegistered: null,
+      databaseConfigured: Boolean(
+        process.env.SUPABASE_URL?.trim() && process.env.SUPABASE_SERVICE_ROLE_KEY?.trim()
+      ),
+      databaseReachable: null,
+      lastDatabaseCheckAt: null,
+    };
+
     return {
       service: 'meal-tracker-bot',
       whatsappConnection: this.connectionState,
@@ -107,9 +139,18 @@ export class WhatsAppService {
       lastMessageAt: this.lastMessageAt,
       reconnectAttempt: this.reconnectAttempt,
       reconnectScheduled: this.reconnectTimer !== null,
-      requiresRelink: this.connectionState === 'logged_out',
+      requiresRelink: this.relinkRequired,
+      lastDisconnectCode: this.lastDisconnectCode,
+      lastDisconnectMessage: this.lastDisconnectMessage,
+      qrGeneratedAt: this.qrGeneratedAt,
+      ...authDiagnostics,
       uptimeSeconds: Math.round(process.uptime()),
     };
+  }
+
+  public async getStatusWithDependencies(): Promise<Record<string, unknown>> {
+    await this.supabaseAuthStore?.checkHealth();
+    return this.getStatus();
   }
 
   private async startSocket(): Promise<void> {
@@ -123,10 +164,8 @@ export class WhatsAppService {
     try {
       await this.disposeSocket(this.socket);
 
-      this.ensureAuthDirectory();
-      this.injectSessionCredsIfNeeded();
-
-      const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+      const { state, saveCreds } = await this.loadAuthState();
+      this.relinkRequired = !state.creds.registered;
       const { version, isLatest, error: versionError } = await fetchLatestWaWebVersion();
 
       if (isLatest) {
@@ -139,7 +178,10 @@ export class WhatsAppService {
       }
 
       const socket = makeWASocket({
-        auth: state,
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, this.logger),
+        },
         browser: Browsers.macOS('Meal Tracker BOT'),
         logger: this.logger,
         printQRInTerminal: false,
@@ -152,7 +194,17 @@ export class WhatsAppService {
       this.socket = socket;
       this.botJids = this.extractBotJids(socket.user);
 
-      socket.ev.on('creds.update', saveCreds);
+      socket.ev.on('creds.update', async () => {
+        if (!this.isCurrentSocket(socket, generation)) {
+          return;
+        }
+
+        try {
+          await saveCreds();
+        } catch (error) {
+          console.error('Failed to persist updated WhatsApp credentials:', error);
+        }
+      });
       socket.ev.on('connection.update', async (update) => {
         if (!this.isCurrentSocket(socket, generation)) {
           return;
@@ -181,6 +233,7 @@ export class WhatsAppService {
           }
         }
       });
+      this.startConnectionAttemptTimer(socket, generation);
     } catch (error) {
       this.connectionState = 'close';
       this.lastCloseAt = new Date().toISOString();
@@ -203,6 +256,10 @@ export class WhatsAppService {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      this.connectionState = 'awaiting_qr';
+      this.relinkRequired = true;
+      this.qrGeneratedAt = new Date().toISOString();
+      this.clearConnectionAttemptTimer();
       console.log('\n==================================================================');
       console.log("▼ SCAN THIS QR CODE USING YOUR BOT'S WHATSAPP APPLICATION (LINK DEVICE):");
       console.log('==================================================================\n');
@@ -210,16 +267,23 @@ export class WhatsAppService {
     }
 
     if (connection === 'connecting') {
-      this.connectionState = 'connecting';
+      if (!this.relinkRequired) {
+        this.connectionState = 'connecting';
+      }
       console.log('Connecting to WhatsApp via Baileys...');
       return;
     }
 
     if (connection === 'open') {
       this.connectionState = 'open';
+      this.relinkRequired = false;
       this.lastOpenAt = new Date().toISOString();
+      this.lastDisconnectCode = null;
+      this.lastDisconnectMessage = null;
+      this.qrGeneratedAt = null;
       this.reconnectAttempt = 0;
       this.clearReconnectTimer();
+      this.clearConnectionAttemptTimer();
       this.botJids = this.extractBotJids(socket.user);
       console.log('\n🚀 Success! Meal Tracker Bot is officially online and listening!');
       console.log('Running on Baileys WebSocket transport.');
@@ -239,6 +303,10 @@ export class WhatsAppService {
       const statusCode = this.getDisconnectStatusCode(lastDisconnect?.error);
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
+      this.lastDisconnectCode = statusCode ?? null;
+      this.lastDisconnectMessage = this.getDisconnectMessage(lastDisconnect?.error);
+      this.clearConnectionAttemptTimer();
+
       console.error(`WhatsApp connection closed (status ${statusCode ?? 'unknown'}):`, lastDisconnect?.error);
       await this.disposeSocket(socket, false);
 
@@ -246,9 +314,10 @@ export class WhatsAppService {
         this.scheduleReconnect(`disconnect status ${statusCode ?? 'unknown'}`);
       } else {
         this.connectionState = 'logged_out';
+        this.relinkRequired = true;
         this.reconnectAttempt = 0;
         this.clearReconnectTimer();
-        console.error('WhatsApp session logged out. Delete .baileys_auth and link again.');
+        console.error('WhatsApp session logged out. Clear its persisted auth state and link again.');
       }
     }
   }
@@ -284,6 +353,33 @@ export class WhatsAppService {
     this.reconnectTimer = null;
   }
 
+  private startConnectionAttemptTimer(socket: WASocket, generation: number): void {
+    this.clearConnectionAttemptTimer();
+    this.connectionAttemptTimer = setTimeout(() => {
+      this.connectionAttemptTimer = null;
+      if (!this.isCurrentSocket(socket, generation) || this.relinkRequired) {
+        return;
+      }
+
+      this.connectionState = 'close';
+      this.lastCloseAt = new Date().toISOString();
+      this.lastDisconnectMessage = 'Connection attempt timed out';
+      console.error('WhatsApp connection attempt timed out. Recreating the socket...');
+      void this.disposeSocket(socket).finally(() => {
+        this.scheduleReconnect('connection attempt timed out');
+      });
+    }, CONNECTION_ATTEMPT_TIMEOUT_MS);
+  }
+
+  private clearConnectionAttemptTimer(): void {
+    if (!this.connectionAttemptTimer) {
+      return;
+    }
+
+    clearTimeout(this.connectionAttemptTimer);
+    this.connectionAttemptTimer = null;
+  }
+
   private isCurrentSocket(socket: WASocket, generation: number): boolean {
     return this.socket === socket && this.socketGeneration === generation;
   }
@@ -298,6 +394,7 @@ export class WhatsAppService {
     socket.ev.removeAllListeners('creds.update');
 
     if (this.socket === socket) {
+      this.clearConnectionAttemptTimer();
       this.socket = null;
       this.botJids = [];
     }
@@ -1310,6 +1407,38 @@ export class WhatsAppService {
     };
 
     return maybeBoom.output?.statusCode ?? maybeBoom.statusCode;
+  }
+
+  private getDisconnectMessage(error: unknown): string | null {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    if (error && typeof error === 'object' && 'message' in error) {
+      const message = (error as { message?: unknown }).message;
+      return typeof message === 'string' ? message : null;
+    }
+
+    return null;
+  }
+
+  private loadAuthBackend(): WhatsAppAuthBackend {
+    const configuredBackend = process.env.WHATSAPP_AUTH_BACKEND?.trim().toLowerCase();
+    if (configuredBackend === 'filesystem' || configuredBackend === 'supabase') {
+      return configuredBackend;
+    }
+
+    return process.env.NODE_ENV === 'production' ? 'supabase' : 'filesystem';
+  }
+
+  private async loadAuthState() {
+    if (this.supabaseAuthStore) {
+      return this.supabaseAuthStore.useAuthState();
+    }
+
+    this.ensureAuthDirectory();
+    this.injectSessionCredsIfNeeded();
+    return useMultiFileAuthState(this.authDir);
   }
 
 }

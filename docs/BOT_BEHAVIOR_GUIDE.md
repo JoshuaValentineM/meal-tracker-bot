@@ -30,19 +30,24 @@ What this means:
 - there is no browser automation layer anymore
 - there is no Puppeteer/Chromium dependency anymore
 - WhatsApp Web is accessed through a WebSocket transport
-- the login state is stored with Baileys multi-file auth
+- production stores the complete Baileys auth state in Supabase
+- local development can still use Baileys multi-file auth
+- production wraps database-backed Signal keys in Baileys' in-memory cache to reduce REST queries
 
 Auth storage:
 
-- `.baileys_auth/`: stores Baileys session/auth state
+- `whatsapp_auth_state`: stores production credentials and Signal keys by session, type, and key ID
+- `.baileys_auth/`: optional filesystem state for local development
+- `docs/whatsapp_auth_state_schema.sql`: reference schema and permissions
 
-The current initialization also supports Render-friendly credential injection:
+The legacy filesystem backend also supports credential injection:
 
 - if `SESSION_CREDS_JSON` exists
 - and `.baileys_auth/creds.json` does not exist yet
 - the app writes `creds.json` automatically before calling `useMultiFileAuthState(...)`
 
-This is meant to reduce friction on ephemeral filesystems like Render free tier.
+Production does not fall back to an empty filesystem when Supabase is unavailable. It retries later
+instead of accidentally starting a new WhatsApp session.
 
 ## Lifecycle Logs
 
@@ -413,7 +418,10 @@ Current socket behavior:
 - retries indefinitely with capped exponential backoff: 5, 10, 20, 40, then 60 seconds
 - retries socket startup failures as well as established-connection failures
 - disposes replaced sockets and ignores stale events from older socket generations
-- exposes the retry attempt, scheduled-retry state, and relink requirement through `/status`
+- stops connection attempts that remain stuck for 60 seconds
+- reports QR sessions as `awaiting_qr`
+- exposes retry, QR, disconnect, auth-store, and database health through `/status`
+- makes `/status` query Supabase so an external cron keeps both Render and Supabase active
 
 Media download behavior:
 
@@ -456,6 +464,8 @@ Known variables used now:
 - `TARGET_GROUP_NAME`
 - `BAILEYS_AUTH_DIR`
 - `SESSION_CREDS_JSON`
+- `WHATSAPP_AUTH_BACKEND`
+- `WHATSAPP_SESSION_ID`
 
 Example:
 
@@ -468,6 +478,8 @@ BOT_TRIGGER_ALIASES=Meal Tracker BOT
 TARGET_GROUP_NAME=
 BAILEYS_AUTH_DIR=.baileys_auth
 SESSION_CREDS_JSON=
+WHATSAPP_AUTH_BACKEND=filesystem
+WHATSAPP_SESSION_ID=meal-tracker-primary
 ```
 
 ## Current Dev Commands
@@ -513,7 +525,7 @@ Current limitations still in place:
 - no direct-message support
 - nutrition output is still estimation, not verified food-label data
 - Gemini quota and billing can still block analysis if the project has no usable quota
-- Render session injection currently restores `creds.json`, but a full persistent auth store may still be needed if Baileys key files become important across restarts
+- Supabase must be reachable before the production WhatsApp socket can start
 
 ## Suggested Use For Future Agents
 
@@ -523,5 +535,5 @@ Before changing behavior, a future agent should check:
 2. Whether plain-text alias triggers should remain alongside true mentions
 3. Whether DM support should be added
 4. Whether image-only mention behavior should stay permissive
-5. Whether full auth persistence beyond `creds.json` should be implemented
+5. Whether application-level encryption should be added on top of Supabase storage encryption for WhatsApp auth rows
 6. Whether the next milestone is weekly summaries, target refinements, or dashboard work

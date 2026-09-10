@@ -20,10 +20,26 @@ function startHealthServerIfNeeded(botService: WhatsAppService): void {
     return;
   }
 
-  const server = http.createServer((request, response) => {
+  const server = http.createServer(async (request, response) => {
     if (request.url === '/status') {
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify(botService.getStatus(), null, 2));
+      try {
+        const status = await botService.getStatusWithDependencies();
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify(status, null, 2));
+      } catch (error) {
+        console.error('Failed to build dependency status:', error);
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(
+          JSON.stringify(
+            {
+              ...botService.getStatus(),
+              databaseReachable: false,
+            },
+            null,
+            2
+          )
+        );
+      }
       return;
     }
 

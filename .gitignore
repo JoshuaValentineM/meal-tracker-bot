@@ -18,6 +18,31 @@ dist/
 *.log
 npm-debug.log*
 
+# local editor and agent metadata
+.kiro/
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+
+# temporary files and test output
+.cache/
+coverage/
+.nyc_output/
+tmp/
+*.tsbuildinfo
+
+# local database exports and credentials
+*.backup
+*.dump
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+credentials*.json
+service-account*.json
+
 # macOS
 .DS_Store
 

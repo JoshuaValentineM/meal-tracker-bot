@@ -1,15 +1,12 @@
 services:
-  - type: worker
+  - type: web
     name: meal-tracker-bot
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm ci && npm run build
     startCommand: npm start
     maxShutdownDelaySeconds: 60
-    disk:
-      name: baileys-auth
-      mountPath: /opt/render/project/src/.baileys_auth
-      sizeGB: 1
+    healthCheckPath: /
     envVars:
       - key: NODE_ENV
         value: production
@@ -25,5 +22,7 @@ services:
         value: Meal Tracker BOT
       - key: TARGET_GROUP_NAME
         value: ""
-      - key: BAILEYS_AUTH_DIR
-        value: /opt/render/project/src/.baileys_auth
+      - key: WHATSAPP_AUTH_BACKEND
+        value: supabase
+      - key: WHATSAPP_SESSION_ID
+        value: meal-tracker-primary
